@@ -14,7 +14,7 @@ OBD2 port (pin 6 CAN-H, 14 CAN-L, 16 +12V, 4/5 GND)
 ```
 
 - 500 kbit/s diagnostic CAN behind the ZGW gateway. Nothing is broadcast here, so the ESP32 has to poll.
-- MHD adapter isn't needed for the screen. It's only used in phase 1 for sniffing (see 4.3).
+- MHD adapter isn't needed for the screen. MHD uses ENET, and its earlier captures are a DID source.
 
 ## 2. Parts list
 
@@ -27,10 +27,9 @@ OBD2 port (pin 6 CAN-H, 14 CAN-L, 16 +12V, 4/5 GND)
 | 5 | microSD card, 8–32 GB | Log clip storage | ~5 € | buy |
 | 6 | Momentary push buttons (2×), ideally on a cable to the gear-lever area | Mode / save clip | – | have |
 | 7 | Voltage divider (100 kΩ / 22 kΩ + 100 nF) on +12 V into an ADC pin | Engine-running detect (>13.2 V = alternator charging) so the car isn't kept awake | <1 € | buy |
-| 8 | OBD2 Y-splitter (1 male → 2 female) | Phase 1: sniff MHD traffic in parallel | ~10 € | buy |
-| 9 | IMU module (ICM-42688 or MPU-6050) | Optional drift backup: yaw rate / lateral g, works even if DSC data is slow | ~3–10 € | optional |
-| 10 | Mount: 3D-printed bracket or vent/phone mount | Install | – | later |
-| – | Existing ESP32 + CAN transceiver | Bench prototype / sniffer during phase 1 | – | have |
+| 8 | IMU module (ICM-42688 or MPU-6050) | Drift backup: yaw rate and lateral g, in case DSC wheel speeds can't be read | ~3–10 € | recommended |
+| 9 | Mount: 3D-printed bracket or vent/phone mount | Install | – | later |
+| – | AZ-Delivery ESP32 DevKitC V4 + CAN transceiver (model unconfirmed), SSD1306 OLED | Prototype for phase 1 | – | have |
 
 Notes:
 - Check in the Waveshare wiki that the board's input range really is 7–36 V before connecting it to 12 V directly. If it isn't, add a 12→5 V buck converter (~5 €).
@@ -45,37 +44,59 @@ Notes:
 
 ## 4. Data sources / IDs
 
-### 4.1 Addressing (BMW UDS over ISO-TP, "extended addressing")
-- Request CAN ID **0x6F1**, first data byte = target ECU address.
-- Response CAN ID **0x600 + ECU address**, first byte = 0xF1.
-- ECU addresses: **DME 0x12** (response 0x612), **DSC 0x29** (response 0x629). These are the standard BMW addresses and need confirming on the car.
-- Standard OBD Mode 01 functional request: **0x7DF**, physical **0x7E0**, response from DME **0x7E8**.
+> Status legend: **works** = confirmed on the car with the ESP32 in earlier chats · **MHD** = seen in MHD ENET captures, not tested on the ESP32 · **lead** = forum or estimate only.
+> Earlier findings are unproven and unreliable. Verify everything again in phase 1.
 
-### 4.2 Candidate signals
+### 4.1 Addressing
+- **0x7DF → 0x7E8** (functional): **works** for OBD Mode 01 and for UDS `22 44 02`.
+- **0x7E0 → 0x7E8** (physical DME): this is what the ZGW uses internally (from ENET traffic). Not yet tested from the ESP32.
+- **0x6F1 + target byte → 0x600+addr** (BMW extended addressing over D-CAN): untested. **DME 0x12** is confirmed as the DME address in the ENET captures. **DSC 0x29** is a standard BMW address that hasn't been seen on this car.
+- The ZGW filters PT-CAN. Passive listening only sees **0x130** (on E-series that is terminal/ignition status, which could serve as an ignition-on signal; unverified).
+- MHD talks **ENET** (DoIP-like, 192.168.10.10:6801, tester 0xF4 → DME 0x12), not CAN. A CAN sniffer can't see MHD traffic, so use the ENET captures for that.
+- ISO-TP: single-frame only so far. Multi-frame handling is needed for F300 and other long DIDs.
 
-| Signal | Source | Request | Formula | Confidence |
-|---|---|---|---|---|
-| RPM | OBD 01 | PID 0x0C | (256A+B)/4 rpm | high |
-| Coolant temp | OBD 01 | PID 0x05 | A−40 °C | high |
-| Intake air temp | OBD 01 | PID 0x0F | A−40 °C | high |
-| MAP / boost | OBD 01 | PID 0x0B | A kPa abs (boost = MAP − baro) | high |
-| Baro | OBD 01 | PID 0x33 | A kPa | high |
-| Calc. load | OBD 01 | PID 0x04 | A·100/255 % | high |
-| Throttle | OBD 01 | PID 0x11 | A·100/255 % | high |
-| Lambda / AFR (wideband) | OBD 01 | PID 0x24 or 0x34 (bank 1 sensor 1) | λ = (256A+B)·2/65536; AFR = λ·14.7 | medium (depends on which PIDs are supported, read PID 0x00/0x20) |
-| Vehicle speed | OBD 01 | PID 0x0D | A km/h | high |
-| **Oil temp** | DME UDS | **22 44 02** (DID 0x4402) | A−64 °C (community Torque setup for F20 N13) | medium, verify |
-| Oil pressure | DME UDS | TBD, find in phase 1 | – | low. I'm not sure the N13 reports a real pressure value |
-| Boost target / actual (BMW) | DME UDS | TBD (sniff MHD) | – | low |
-| Wheel speeds ×4 | DSC 0x29 UDS | TBD DID, find via scan / sniff | – | low |
-| Wheel speeds ×4 (alt.) | PT-CAN broadcast | E90 uses ID 0x0CE; the F-series ID is TBD (Racelogic F30 CAN DB lists wheel speeds) | – | low, only if needed |
-| Steering angle / yaw | DSC / PT-CAN | TBD | – | low |
+### 4.2 Signals
 
-### 4.3 How to find the TBD IDs (phase 1)
-1. **Supported-PID scan:** Mode 01 PIDs 0x00/0x20/0x40/0x60 tell you exactly which standard PIDs the DME supports.
-2. **Sniff MHD:** put the Y-splitter on the OBD port, connect the MHD adapter plus the ESP32 in listen-only mode, and log in the MHD app with oil temp, boost, lambda and so on. The ESP32 records every 0x6F1 request and the replies, which shows which DIDs or memory reads MHD uses.
-3. **DID sweep:** in a controlled sweep of `22 xx xx` against DME 0x12 and DSC 0x29 (ignition on, engine off), log the positive responses and correlate them by changing conditions (warm-up, turning wheels, rolling).
-4. **Fallback if DSC polling is below 10 Hz:** tap PT-CAN for broadcast wheel speeds, or use the IMU for drift detection.
+| Signal | Request | Formula | Status |
+|---|---|---|---|
+| Engine load | OBD 01 04 | A·100/255 % | works |
+| Coolant temp | OBD 01 05 | A−40 °C | works |
+| MAP | OBD 01 0B | A kPa abs | works |
+| IAT | OBD 01 0F | A−40 °C | works |
+| Baro | OBD 01 33 | A kPa | works |
+| Boost (derived) | MAP − Baro | kPa → ×0.145 psi | works (derived) |
+| RPM | OBD 01 0C | (256A+B)/4 | untested, standard |
+| Throttle | OBD 01 11 | A·100/255 % | untested, standard |
+| Lambda / AFR | OBD 01 24 / 34 / 44 | λ=(256A+B)·2/65536, AFR=λ·14.7 | untested. Check support with PID 00/20/40 |
+| Oil temp (OBD) | OBD 01 5C | – | **not supported** |
+| **Oil temp** | UDS 22 44 02 | (A·256+B)−64 °C **or** raw·0.7037−43.74 | works (reply `05 62 44 02 00 42`). The formula is unresolved, so compare with MHD at hot oil |
+| Coolant (BMW) | UDS 22 43 00 | raw·0.7333−46.4 | MHD |
+| IAT (BMW) | UDS 22 58 0B | raw16·0.04762−1217 | MHD, 2-point fit |
+| Boost manifold | UDS 22 4A B0 | raw16·0.000576−14.93 psi | MHD, 2-point fit |
+| Oil pressure | UDS 22 58 6F | unknown (A ≈ 9–12) | lead |
+| Boost act/target, oil T/P, RPM, timing corr. | UDS 22 D9 0B / D9 06 / D9 6E / D9 6F / F4 0C / D0 12–16 | estimates | lead |
+| IAT / oil (MHD session start) | UDS 22 F1 50 / 58 6A | – | MHD |
+| F300 composite | 2C 01 define + 22 F3 00 | layout changes per session | MHD only, avoid. Poll individual DIDs instead |
+| Wheel speeds ×4 | DSC 0x29 via 6F1, DID TBD | – | **not found** |
+| Steering / yaw | 0x130? / DSC | – | not found |
+
+### 4.3 Known issues from earlier attempts
+- **ESP and TPMS warnings after driving**, which cleared after unplugging. Likely causes are high-rate UDS requests on the functional 0x7DF (every ECU on the gateway gets them) and no rate limiting. Fixes to try, in order:
+  1. Physical 0x7E0 (or 6F1/0x12) instead of 0x7DF.
+  2. A lower total poll rate (start at ≤10 requests/s).
+  3. TesterPresent `3E 80` every 2 s, only if a session is used.
+  4. Reading DTCs to see which ECU complains.
+- **Parser bug:** `requestUSDData` checks `data[0]==0x04`, but the 2-byte DID reply has `data[0]==0x05`. It should check the length per DID instead.
+- **ISTA over ENET doesn't connect** ("cable unplugged"). Possibly OBD pins, the fuse or the ZGW. Separate issue.
+- No NRCs were ever logged. The scanner should log `7F 22 xx`.
+
+### 4.4 Phase 1 plan (discovery)
+1. Fix the parser and switch to physical 0x7E0. Confirm that the working signals still work and that no ESP/TPMS warnings appear after a 30 min drive.
+2. Supported-PID scan (01 00/20/40/60) to find RPM, throttle and lambda support.
+3. Test 6F1 addressing: `6F1: 12 03 22 44 02` → expect reply on 0x612. If that works, try DSC `6F1: 29 03 22 F1 90` (VIN) → 0x629.
+4. If DSC answers: a slow DID sweep on 0x29 with the wheels lifted or rolling, to find the wheel-speed DID. Measure the achievable rate.
+5. Resolve the oil temp formula and the 586F oil pressure DID against MHD readings, warm and cold.
+6. **Drift fallback:** if no wheel speeds can be read at ≥10 Hz, use an IMU (yaw rate vs. speed gives the slip angle) plus RPM/speed ratio for wheelspin. One-wheel versus two-wheel detection then isn't possible, and only "drift angle" plus "wheelspin" can be shown.
 
 ## 5. Modes
 
@@ -89,7 +110,7 @@ Notes:
 
 ## 6. Phases
 
-1. **Discovery:** PID/DID scanner + sniffer on the existing ESP32. Fill the TBDs in 4.2 and measure poll rates.
+1. **Discovery:** see 4.4. Scanner on the existing ESP32, with no new parts needed.
 2. **Data layer:** poll scheduler (fast: wheel speeds, RPM, MAP, about 20 Hz; slow: temps, 1–2 Hz), engine-running detection, sleep.
 3. **Logger:** PSRAM ring buffer, clip save, WiFi AP + download page.
 4. **UI:** LVGL Normal / Drift / Warning screens on the 4.3B.
